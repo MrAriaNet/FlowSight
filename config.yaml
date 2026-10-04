@@ -1,0 +1,51 @@
+listen:
+  netflow_host: 0.0.0.0
+  netflow_port: 2055
+  sflow_host: 0.0.0.0
+  sflow_port: 6343
+
+accept_unknown_exporters: true
+
+local_networks:
+  - 203.0.113.0/24
+  - 2001:db8::/32
+
+local_asns:
+  - 64500
+
+exporters:
+  - id: edge1
+    name: Edge Router 1
+    address: 192.0.2.1
+    enabled: true
+  - id: edge2
+    name: Edge Router 2
+    address: 192.0.2.2
+    enabled: true
+
+ripe:
+  enabled: true
+  url: https://stat.ripe.net/data/network-info/data.json
+  cache_path: data/ripe_asn_cache.json
+
+database_path: data/collector.db
+
+aggregation:
+  window_seconds: 60
+  retention_minutes: 120
+
+attack:
+  enabled: true
+  window_seconds: 10
+  tcp_syn_pps: 50000
+  tcp_scan_unique_ports: 100
+  udp_flood_pps: 80000
+  cooldown_seconds: 60
+  output_dir: alerts
+
+reports:
+  dir: reports
+  auto_save_seconds: 300
+  keep_files: 48
+  window_seconds: 300
+  limit: 20
