@@ -49,3 +49,14 @@ reports:
   keep_files: 48
   window_seconds: 300
   limit: 20
+
+# Destination-ASN delivery aggregation (source IP ignored)
+as_traffic:
+  enabled: true
+  iface_field: input          # input | output
+  flush_seconds: 600          # 10 minutes
+  retention_days: 90
+  # Optional interface filter (omit / empty = all)
+  interfaces:
+  #   - 10
+  #   - 20
