@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""NetFlow v5/v9, IPFIX, and sFlow CLI collector (multi-router)."""
+"""FlowSight — NetFlow/sFlow collector + destination-ASN delivery aggregator.
+
+Classic capabilities: multi-router NetFlow v5/v9, IPFIX, sFlow, live IP/ASN
+reports, attack alerts, report collection.
+
+AS Traffic: aggregate by destination ASN per interface (ignore source IP),
+flush every N minutes, hourly/daily/monthly share reports.
+"""
 
 from __future__ import annotations
 
@@ -222,6 +229,12 @@ class Config:
     reports_keep: int = 48
     reports_window: int = 300
     reports_limit: int = 20
+    # Destination-ASN delivery aggregation (high-volume path)
+    as_enabled: bool = True
+    as_iface_field: str = "input"  # input|output
+    as_interfaces: set[int] = field(default_factory=set)
+    as_flush_seconds: int = 600
+    as_retention_days: int = 90
 
 
 def load_config(path: str) -> Config:
@@ -233,6 +246,16 @@ def load_config(path: str) -> Config:
     attack = raw.get("attack") or {}
     ripe = raw.get("ripe") or {}
     reports = raw.get("reports") or {}
+    as_traffic = raw.get("as_traffic") or {}
+    ifaces_raw = as_traffic.get("interfaces") or []
+    if not isinstance(ifaces_raw, list):
+        ifaces_raw = []
+    iface_set: set[int] = set()
+    for x in ifaces_raw:
+        try:
+            iface_set.add(int(x))
+        except (TypeError, ValueError):
+            continue
     exporters = [
         Exporter(
             id=str(item["id"]),
@@ -272,6 +295,11 @@ def load_config(path: str) -> Config:
         reports_keep=int(reports.get("keep_files", 48)),
         reports_window=int(reports.get("window_seconds", 300)),
         reports_limit=int(reports.get("limit", 20)),
+        as_enabled=bool(as_traffic.get("enabled", True)),
+        as_iface_field=str(as_traffic.get("iface_field", "input")).lower(),
+        as_interfaces=iface_set,
+        as_flush_seconds=int(as_traffic.get("flush_seconds", 600)),
+        as_retention_days=int(as_traffic.get("retention_days", 90)),
     )
 
 
@@ -297,6 +325,8 @@ class Flow:
     dst_asn: int = 0
     tcp_flags: int = 0
     sampling_rate: int = 1
+    input_iface: int = 0
+    output_iface: int = 0
     direction: str = "unknown"
     source: str = ""
     source_id: int = 0
@@ -618,6 +648,8 @@ def parse_v5(data: bytes, exp: str, rid: str, name: str, ts: float) -> list[Flow
                 dst_asn=f[16],
                 tcp_flags=f[12],
                 sampling_rate=sampling,
+                input_iface=int(f[3]),
+                output_iface=int(f[4]),
                 source="netflow_v5",
             )
         )
@@ -818,6 +850,8 @@ def values_to_flow(
         dst_asn=_u(values.get(IE_DST_AS, b"")),
         tcp_flags=_u(values.get(IE_TCP_FLAGS, b"")),
         sampling_rate=sampling,
+        input_iface=_u(values.get(IE_IN_IF, b"")),
+        output_iface=_u(values.get(IE_OUT_IF, b"")),
         source=source,
         source_id=sid,
     )
@@ -1015,6 +1049,18 @@ class Store:
                 window_start INTEGER, router_id TEXT, bytes INTEGER, packets INTEGER, flows INTEGER,
                 PRIMARY KEY (window_start, router_id)
             );
+            CREATE TABLE IF NOT EXISTS asn_bucket (
+                bucket_start INTEGER NOT NULL,
+                router_id TEXT NOT NULL,
+                iface INTEGER NOT NULL,
+                asn INTEGER NOT NULL,
+                bytes INTEGER NOT NULL DEFAULT 0,
+                packets INTEGER NOT NULL DEFAULT 0,
+                flows INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (bucket_start, router_id, iface, asn)
+            );
+            CREATE INDEX IF NOT EXISTS idx_asn_bucket_time
+                ON asn_bucket(bucket_start, router_id, iface);
             """
         )
         self._last_clean = 0.0
@@ -1159,12 +1205,149 @@ class Store:
         ).fetchone()
         return int(row["bytes"] if row else 0)
 
+    def flush_asn_buckets(
+        self, bucket_start: int, counters: dict[tuple[str, int, int], list[int]]
+    ) -> int:
+        if not counters:
+            return 0
+        cur = self.conn.cursor()
+        n = 0
+        for (router_id, iface, asn), (b, p, f) in counters.items():
+            cur.execute(
+                """
+                INSERT INTO asn_bucket (bucket_start, router_id, iface, asn, bytes, packets, flows)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(bucket_start, router_id, iface, asn) DO UPDATE SET
+                    bytes = bytes + excluded.bytes,
+                    packets = packets + excluded.packets,
+                    flows = flows + excluded.flows
+                """,
+                (bucket_start, router_id, iface, asn, b, p, f),
+            )
+            n += 1
+        self.conn.commit()
+        return n
+
+    def cleanup_asn_buckets(self, retention_days: int) -> None:
+        cut = int(time.time()) - retention_days * 86400
+        self.conn.execute("DELETE FROM asn_bucket WHERE bucket_start < ?", (cut,))
+        self.conn.commit()
+
+    def asn_delivery_report(
+        self,
+        period: str,
+        router_id: Optional[str] = None,
+        iface: Optional[int] = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        end = int(time.time())
+        start = end - {"hour": 3600, "day": 86400, "month": 30 * 86400}[period]
+        clauses = ["bucket_start >= ?", "bucket_start < ?"]
+        params: list[Any] = [start, end]
+        if router_id:
+            clauses.append("router_id = ?")
+            params.append(router_id)
+        if iface is not None:
+            clauses.append("iface = ?")
+            params.append(iface)
+        where = " AND ".join(clauses)
+        rows = self.conn.execute(
+            f"""
+            SELECT asn, SUM(bytes) AS bytes, SUM(packets) AS packets, SUM(flows) AS flows
+            FROM asn_bucket WHERE {where}
+            GROUP BY asn ORDER BY bytes DESC LIMIT ?
+            """,
+            params + [limit],
+        ).fetchall()
+        total_row = self.conn.execute(
+            f"SELECT COALESCE(SUM(bytes), 0) AS bytes FROM asn_bucket WHERE {where}",
+            params,
+        ).fetchone()
+        grand = int(total_row["bytes"] if total_row else 0) or 1
+        out = []
+        for r in rows:
+            b = int(r["bytes"] or 0)
+            out.append(
+                {
+                    "asn": int(r["asn"]),
+                    "bytes": b,
+                    "packets": int(r["packets"] or 0),
+                    "flows": int(r["flows"] or 0),
+                    "percent": round(100.0 * b / grand, 2),
+                }
+            )
+        return out
+
+    def asn_delivery_total(
+        self, period: str, router_id: Optional[str] = None, iface: Optional[int] = None
+    ) -> int:
+        end = int(time.time())
+        start = end - {"hour": 3600, "day": 86400, "month": 30 * 86400}[period]
+        clauses = ["bucket_start >= ?", "bucket_start < ?"]
+        params: list[Any] = [start, end]
+        if router_id:
+            clauses.append("router_id = ?")
+            params.append(router_id)
+        if iface is not None:
+            clauses.append("iface = ?")
+            params.append(iface)
+        row = self.conn.execute(
+            f"SELECT COALESCE(SUM(bytes), 0) AS bytes FROM asn_bucket WHERE {' AND '.join(clauses)}",
+            params,
+        ).fetchone()
+        return int(row["bytes"] if row else 0)
+
     def close(self) -> None:
         try:
             self.flush()
         except Exception:
             pass
         self.conn.close()
+
+
+class AsnDelivery:
+    """In-memory destination-ASN aggregation; flush periodically to asn_bucket."""
+
+    def __init__(self, cfg: Config, store: Store) -> None:
+        self.cfg = cfg
+        self.store = store
+        self.counters: dict[tuple[str, int, int], list[int]] = defaultdict(lambda: [0, 0, 0])
+        self.samples = 0
+        self.flushes = 0
+        self.last_flush = time.time()
+
+    def add(self, flow: Flow) -> None:
+        if not self.cfg.as_enabled:
+            return
+        iface = flow.output_iface if self.cfg.as_iface_field == "output" else flow.input_iface
+        if self.cfg.as_interfaces and iface not in self.cfg.as_interfaces:
+            return
+        asn = flow.dst_asn if flow.dst_asn > 0 else 0
+        key = (flow.router_id, iface, asn)
+        c = self.counters[key]
+        c[0] += flow.scaled_bytes
+        c[1] += flow.scaled_packets
+        c[2] += 1
+        self.samples += 1
+
+    def flush(self) -> int:
+        if not self.counters:
+            self.last_flush = time.time()
+            return 0
+        now = int(time.time())
+        bucket = now - (now % max(self.cfg.as_flush_seconds, 1))
+        snapshot = self.counters
+        self.counters = defaultdict(lambda: [0, 0, 0])
+        n = self.store.flush_asn_buckets(bucket, snapshot)
+        self.flushes += 1
+        self.last_flush = time.time()
+        if self.flushes % 6 == 0:
+            self.store.cleanup_asn_buckets(self.cfg.as_retention_days)
+        return n
+
+    def top_memory(self, limit: int = 15) -> list[tuple]:
+        items = sorted(self.counters.items(), key=lambda kv: kv[1][0], reverse=True)[:limit]
+        return items
 
 
 class Detector:
@@ -1328,6 +1511,7 @@ class Collector:
         self.cfg = cfg
         self.routers = Routers(cfg)
         self.store = Store(cfg.database_path, cfg.window_seconds, cfg.retention_minutes)
+        self.asn_delivery = AsnDelivery(cfg, self.store)
         self.detector = Detector(cfg)
         self.templates = TemplateParser()
         self.ripe = RipeAsn(cfg)
@@ -1384,6 +1568,7 @@ class Collector:
             flow.direction = classify(flow, self.cfg, self.routers)
             self.store.ingest(flow)
             self.live.add(flow)
+            self.asn_delivery.add(flow)
             self.alerts += self.detector.process(flow)
             self.flows += 1
             self.last_flow = flow.timestamp
@@ -1391,6 +1576,10 @@ class Collector:
         self.routers.note(rid, name, exp, source, len(flows), templates)
 
     def close(self) -> None:
+        try:
+            self.asn_delivery.flush()
+        except Exception:
+            pass
         self.ripe.save(force=True)
         self.store.close()
 
@@ -1440,6 +1629,11 @@ async def cmd_run(config_path: str) -> int:
     _tune_udp(nf_t)
     _tune_udp(sf_t)
     print(f"Listening NetFlow {cfg.netflow_host}:{cfg.netflow_port}  sFlow {cfg.sflow_host}:{cfg.sflow_port}")
+    if cfg.as_enabled:
+        print(
+            f"AS delivery: ON  iface_field={cfg.as_iface_field}  "
+            f"flush={cfg.as_flush_seconds}s  filter={sorted(cfg.as_interfaces) or 'ALL'}"
+        )
     if cfg.reports_auto_seconds > 0:
         print(f"Auto-collect reports every {cfg.reports_auto_seconds}s -> {cfg.reports_dir}/")
     print("Live traffic report. Ctrl+C to stop.\n")
@@ -1449,8 +1643,26 @@ async def cmd_run(config_path: str) -> int:
             try:
                 col.routers.reload_state()
                 col.store.flush()
+                if cfg.as_enabled and time.time() - col.asn_delivery.last_flush >= cfg.as_flush_seconds:
+                    n = col.asn_delivery.flush()
+                    print(f"\n[as-flush] wrote {n} ASN buckets", flush=True)
                 print("\033[H\033[J", end="")
                 print_report(col, window=60, limit=10, live=True)
+                if cfg.as_enabled:
+                    print("AS DELIVERY (in-memory window → destination ASN)")
+                    top = col.asn_delivery.top_memory(10)
+                    _print_table(
+                        ["Router", "Iface", "ASN", "Bytes", "Packets", "Flows"],
+                        [
+                            [r, i, a if a else "unknown", _fmt_bytes(b), p, f]
+                            for (r, i, a), (b, p, f) in top
+                        ],
+                    )
+                    print(
+                        f"as_samples={col.asn_delivery.samples}  "
+                        f"as_flushes={col.asn_delivery.flushes}  "
+                        f"next_flush~{max(0, int(cfg.as_flush_seconds - (time.time() - col.asn_delivery.last_flush)))}s\n"
+                    )
                 if cfg.reports_auto_seconds > 0 and time.time() - last_collect >= cfg.reports_auto_seconds:
                     path = save_collected_report(col, live=False)
                     print(f"\n[auto-collect] saved {path}", flush=True)
@@ -1820,6 +2032,60 @@ def cmd_set_router(args, enabled: bool) -> int:
     return 0
 
 
+def cmd_asn(args) -> int:
+    """Destination-ASN delivery reports (hourly / daily / monthly)."""
+    col = open_collector(args.config)
+    try:
+        if not col.cfg.as_enabled:
+            print("AS traffic aggregation is disabled in config (as_traffic.enabled: false)")
+            return 1
+        rows = col.store.asn_delivery_report(
+            period=args.period,
+            router_id=args.router,
+            iface=args.iface,
+            limit=args.limit,
+        )
+        total = col.store.asn_delivery_total(args.period, args.router, args.iface)
+        title = f"ASN DELIVERY  period={args.period}  total={_fmt_bytes(total)}"
+        if args.router:
+            title += f"  router={args.router}"
+        if args.iface is not None:
+            title += f"  iface={args.iface}"
+        print(title)
+        print(f"generated={_fmt_ts(time.time())}")
+        print("Traffic sent toward destination ASNs (source IP ignored in aggregation)")
+        print()
+        _print_table(
+            ["ASN", "Bytes", "Packets", "Flows", "Share %"],
+            [
+                [
+                    r["asn"] if r["asn"] else "unknown",
+                    _fmt_bytes(r["bytes"]),
+                    r["packets"],
+                    r["flows"],
+                    f"{r['percent']:.2f}%",
+                ]
+                for r in rows
+            ],
+        )
+        if args.save:
+            out_dir = Path(col.cfg.reports_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            path = out_dir / f"asn_delivery_{args.period}_{stamp}.txt"
+            lines = [title, f"generated={_fmt_ts(time.time())}", "", "ASN  Bytes  Packets  Flows  Share%"]
+            for r in rows:
+                lines.append(
+                    f"{r['asn'] if r['asn'] else 'unknown'}  {_fmt_bytes(r['bytes'])}  "
+                    f"{r['packets']}  {r['flows']}  {r['percent']:.2f}%"
+                )
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            print(f"\nSaved: {path}")
+    finally:
+        col.close()
+    return 0
+
+
 def cmd_status(args) -> int:
     cfg = load_config(args.config)
     print("Config:", args.config)
@@ -1829,6 +2095,11 @@ def cmd_status(args) -> int:
     print(f"Routers {len(cfg.exporters)}  unknown={'accept' if cfg.accept_unknown else 'reject'}")
     print(f"Local nets: {', '.join(cfg.local_networks) or '-'}")
     print(f"Local ASNs: {', '.join(str(a) for a in cfg.local_asns) or '-'}")
+    print(
+        f"AS delivery: {'ON' if cfg.as_enabled else 'OFF'}  "
+        f"iface={cfg.as_iface_field}  flush={cfg.as_flush_seconds}s  "
+        f"ifaces={sorted(cfg.as_interfaces) or 'ALL'}"
+    )
     if Path(cfg.database_path).exists():
         col = Collector(cfg)
         try:
@@ -1840,21 +2111,33 @@ def cmd_status(args) -> int:
                     for r in col.store.router_totals(300)
                 ],
             )
+            print("\nASN delivery totals")
+            for period in ("hour", "day", "month"):
+                print(f"  {period}: {_fmt_bytes(col.store.asn_delivery_total(period))}")
         finally:
             col.close()
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="collector", description="NetFlow / sFlow CLI Collector")
+    p = argparse.ArgumentParser(
+        prog="collector",
+        description="FlowSight — NetFlow/sFlow collector + destination-ASN delivery",
+    )
     p.add_argument("-c", "--config", default="config.yaml")
     sub = p.add_subparsers(dest="command", required=True)
-    sub.add_parser("run", help="Listen and show live in/out traffic")
+    sub.add_parser("run", help="Listen, live report, and ASN delivery aggregation")
     rep = sub.add_parser("report", help="Print inbound/outbound traffic report")
     rep.add_argument("--window", type=int, default=60)
     rep.add_argument("--limit", type=int, default=15)
     rep.add_argument("--router")
     rep.add_argument("--save", action="store_true", help="Also save report under reports/")
+    asn = sub.add_parser("asn", help="Destination-ASN delivery report (hour/day/month)")
+    asn.add_argument("--period", choices=["hour", "day", "month"], default="hour")
+    asn.add_argument("--router")
+    asn.add_argument("--iface", type=int, help="NetFlow interface index")
+    asn.add_argument("--limit", type=int, default=50)
+    asn.add_argument("--save", action="store_true")
     colp = sub.add_parser("collect", help="Collect/save a traffic report to reports/")
     colp.add_argument("--window", type=int, default=None)
     colp.add_argument("--limit", type=int, default=None)
@@ -1874,9 +2157,9 @@ def build_parser() -> argparse.ArgumentParser:
     show = sub.add_parser("show").add_subparsers(dest="show_what", required=True)
     ip = show.add_parser("ip")
     ip.add_argument("value")
-    asn = show.add_parser("asn")
-    asn.add_argument("value", type=int)
-    for s in (ip, asn):
+    ashow = show.add_parser("asn")
+    ashow.add_argument("value", type=int)
+    for s in (ip, ashow):
         s.add_argument("--router")
         s.add_argument("--window", type=int, default=60)
         s.add_argument("--limit", type=int, default=20)
@@ -1895,6 +2178,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return asyncio.run(cmd_run(args.config))
     if args.command == "report":
         return cmd_report(args)
+    if args.command == "asn":
+        return cmd_asn(args)
     if args.command == "collect":
         return cmd_collect(args)
     if args.command == "reports":
