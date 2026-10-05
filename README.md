@@ -1,10 +1,10 @@
-# NetFlow / sFlow CLI Collector
+# FlowSight
 
 A lightweight, **single-file** Python collector for network flow telemetry.
 
-It receives **NetFlow v5 / v9**, **IPFIX**, and **sFlow v5** from one or many routers, shows **inbound / outbound** traffic by **IP** and **ASN**, detects simple **TCP/UDP attacks**, and can **collect reports** to disk.
-
 No web UI. No pip packages. No virtualenv. **Python 3 standard library only.**
+
+Main app: [`collector.py`](collector.py) + [`config.yaml`](config.yaml)
 
 ---
 
@@ -28,6 +28,11 @@ No web UI. No pip packages. No virtualenv. **Python 3 standard library only.**
 - **ASN enrichment**
   - Uses the [RIPEstat network-info API](https://stat.ripe.net/docs/02.data-api/network-info.html)
   - Prefix results cached locally to avoid repeated lookups
+- **Destination-ASN delivery aggregation** (high volume)
+  - Ignore source IP; map destination IP → ASN
+  - Aggregate in memory by `(router, interface, dst_asn)`
+  - Flush every N minutes (default 10) into SQLite buckets
+  - Hourly / daily / monthly reports with **percentage share**
 - **Attack detection**
   - TCP SYN flood / TCP flood / TCP port scan
   - UDP flood / UDP amplification heuristic
@@ -58,8 +63,11 @@ cd FlowSight
 # Edit local networks, ASNs, and router addresses
 nano config.yaml
 
-# Start collector (live screen)
+# Start collector (live screen + AS delivery aggregation)
 python3 collector.py run
+
+# Destination-ASN share (after some flush intervals)
+python3 collector.py asn --period hour
 ```
 
 That's it. There is nothing to install with `pip`.
@@ -71,7 +79,7 @@ That's it. There is nothing to install with `pip`.
 ```text
 .
 ├── collector.py      # entire application
-├── config.yaml       # listen ports, routers, thresholds
+├── config.yaml       # listen ports, routers, thresholds, as_traffic
 └── README.md
 ```
 
@@ -179,6 +187,31 @@ reports:
 
 Tune attack thresholds for your traffic baseline. Defaults are intentionally high to reduce false positives on busy links.
 
+### Destination-ASN delivery (high volume)
+
+For peering / delivery reports you usually care about **where traffic went**, not every source IP.  
+AS traffic mode:
+
+1. Destination IP → ASN (exporter ASN field or RIPEstat cache)  
+2. Source IP is **ignored**  
+3. Counters accumulate in memory by `(router, interface, dst_asn)`  
+4. Every **10 minutes** (configurable) counters flush into SQLite  
+5. Reports show ASN share as **percentage** for hour / day / month  
+
+```yaml
+as_traffic:
+  enabled: true
+  iface_field: input          # input | output
+  flush_seconds: 600          # 10 minutes
+  retention_days: 90
+  # Optional interface filter (omit / empty = all)
+  interfaces:
+  #   - 10
+  #   - 20
+```
+
+Why this scales: no per-flow / per-IP rows for delivery stats — only in-memory aggregation and periodic bucket flush.
+
 ---
 
 ## Usage
@@ -196,8 +229,17 @@ Live screen includes:
 - router state
 - inbound / outbound top IPs
 - inbound / outbound top ASNs
+- AS-delivery memory tops + flush countdown (when `as_traffic.enabled`)
 
-Press `Ctrl+C` to stop. A final report is saved under `reports/`.
+Press `Ctrl+C` to stop. A final report is saved under `reports/`. ASN buckets are flushed on shutdown.
+
+### Destination-ASN reports
+
+```bash
+python3 collector.py asn --period hour
+python3 collector.py asn --period day --iface 10 --router edge1
+python3 collector.py asn --period month --save
+```
 
 ### One-shot traffic report
 
@@ -337,6 +379,7 @@ Routers / Exporters
    ├── enrich ASN via RIPEstat (cached)
    ├── classify direction (local CIDR / ASN)
    ├── aggregate in SQLite + live memory window
+   ├── AS delivery: (router, iface, dst_asn) -> flush buckets
    ├── detect TCP/UDP attacks -> alerts/*.txt
    └── collect reports -> reports/*.txt
 ```
@@ -353,15 +396,16 @@ Important design notes:
 
 | Command | Description |
 |---------|-------------|
-| `run` | Start listeners and show live traffic |
-| `report` | Print a traffic report (`--save` writes to disk) |
+| `run` | Start listeners, live traffic, and AS-delivery aggregation |
+| `report` | Print inbound/outbound traffic report (`--save` writes to disk) |
+| `asn` | Destination-ASN delivery report (`hour` / `day` / `month`) |
 | `collect` | Save a collected report under `reports/` |
 | `reports` | List / show collected reports (`--latest`, `--show`) |
 | `top ip` / `top asn` | Top talkers |
 | `show ip` / `show asn` | Detail for one IP or ASN |
 | `routers` | List exporters and state |
 | `enable` / `disable` | Toggle a router |
-| `status` | Show config summary |
+| `status` | Show config summary (includes AS-delivery totals) |
 
 Global option:
 
